@@ -35,7 +35,7 @@ def load(conn, snap_id: int) -> pd.DataFrame:
         "       v.employer_trusted, v.employer_accredited_it, v.employer_rating, v.employer_reviews, "
         "       v.employer_hr_brand, v.employer_category, v.branded, v.test_required, v.letter_required, v.accept_incomplete, "
         "       o.responses, o.total_responses, o.manager_activity, "
-        "       v.published_at, v.url, v.salary_from, v.salary_to, v.currency, sr.total_found "
+        "       v.published_at, v.created_at, v.url, v.salary_from, v.salary_to, v.currency, sr.total_found "
         "FROM observations o "
         "JOIN professions p ON p.id = o.profession_id "
         "JOIN industries i ON i.id = p.industry_id "
@@ -56,6 +56,9 @@ def load(conn, snap_id: int) -> pd.DataFrame:
     obs_t = pd.to_datetime(df["observed_at"], utc=True)
     pub_t = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
     df["age_days"] = (obs_t - pub_t).dt.total_seconds() / 86400
+    # Срок жизни — от создания вакансии: при продлении hh обновляет дату публикации, а дату создания нет.
+    cre_t = pd.to_datetime(df["created_at"], utc=True, errors="coerce").fillna(pub_t)
+    df["life_days"] = (obs_t - cre_t).dt.total_seconds() / 86400
     return df
 
 

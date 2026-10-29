@@ -247,5 +247,5 @@ def topup(conn, client: Client, search_cfg: dict, snapshot_id: int, min_cover: f
         print(f"  {i}/{len(roles)} роль {role_id}: +{stats['new']} вакансий (было {n0}, стало {len(seen)} из {total}), "
               f"запросов {stats['req']}", flush=True)
     conn.execute("UPDATE snapshots SET finished_at = ?, notes = ? WHERE id = ?",
-                 (now(), "основной сбор 13:49–15:39, докачка крупных профессий после", snapshot_id))
+                 (now(), f"докачка крупных профессий до {now()[11:16]}", snapshot_id))
     conn.commit()

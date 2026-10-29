@@ -19,7 +19,7 @@ from . import analyze
 from .db import MSK
 from .report_html import MONTHS_FULL
 
-TITLE = "Рейтинг удалённых профессий"
+TITLE = "Рейтинг вакансий hh.ru"
 AREA_NAMES = {113: "Вся Россия", 1: "Москва", 2: "Санкт-Петербург"}
 
 
@@ -72,11 +72,19 @@ def _when(ts: str) -> str:
     return f"{t.day} {MONTHS_FULL[t.month - 1]} {t.year}, {t:%H:%M}"
 
 
-def build_data(conn, cfg: dict, snapshot_id: int | None, top: int | None) -> dict:
+def build_data(conn, cfg: dict, snapshot_id: int | None, top: int | None, best: int | None = None) -> dict:
     snap_id = analyze._pick_snapshot(conn, snapshot_id)
     full = conn.execute("SELECT work_format FROM snapshots WHERE id = ?", (snap_id,)).fetchone()[0] == ""
     d = analyze.prepare(conn, cfg, snap_id, top, formats="all" if full else "pure")
     sample, dups, snap = d["sample"], d["dups"], d["snap"]
+    min_n = cfg["curation"]["min_pure_remote"]
+    if best:
+        # Только best вакансий с наибольшим числом откликов по всем профессиям; одна вакансия — одна строка.
+        sample = (sample.sort_values("responses", ascending=False, na_position="last")
+                  .drop_duplicates("vacancy_id").head(best))
+        keys = set(zip(sample["profession_id"], sample["dup_key"]))
+        dups = dups[[k in keys for k in zip(dups["profession_id"], dups["dup_key"])]]
+        min_n = 1
     profs = (sample.groupby(["profession_id", "profession", "industry"])
              .agg(total_found=("total_found", "first")).reset_index())
     industries = sorted(profs["industry"].unique())
@@ -106,6 +114,8 @@ def build_data(conn, cfg: dict, snapshot_id: int | None, top: int | None) -> dic
             age = None if pd.isna(v.age_days) else math.floor(float(v.age_days) * 100) / 100
             rating = None if v.employer_rating is None or pd.isna(v.employer_rating) else round(float(v.employer_rating), 1)
             pub = _str(v.published_at)
+            cre = _str(v.created_at) or pub
+            life = None if pd.isna(v.life_days) else math.floor(float(v.life_days) * 100) / 100
             reg = region_of.get(int(v.area_id)) if v.area_id is not None and not pd.isna(v.area_id) else None
             if reg:
                 region_n.setdefault(reg[0], [reg[0], reg[1], 0])[2] += 1
@@ -118,6 +128,7 @@ def build_data(conn, cfg: dict, snapshot_id: int | None, top: int | None) -> dic
                 _int(v.responses), idx("areas", v.area_name), placement(v.properties), flags(v), rating,
                 _int(v.employer_reviews), idx("employment", v.employment), idx("schedule", v.schedule),
                 idx("hours", v.working_hours), int(v.fmt), reg[0] if reg else 0,
+                life, (snap_day - date.fromisoformat(cre[:10])).days if cre else None,
             ])
     finished = datetime.fromisoformat(snap["finished_at"] or snap["started_at"]).astimezone(MSK)
     return {
@@ -125,7 +136,7 @@ def build_data(conn, cfg: dict, snapshot_id: int | None, top: int | None) -> dic
             "snapshot": d["snap_id"], "kind": snap["kind"], "date": snap["started_at"][:10],
             "when": f"{_when(snap['started_at'])}–{finished:%H:%M} МСК",
             "area": AREA_NAMES.get(snap["area_id"]) or str(snap["area_id"]),
-            "top": d["top"] or 0, "min_n": cfg["curation"]["min_pure_remote"],
+            "top": d["top"] or 0, "min_n": min_n,
             "dups": int(len(dups)), "formats": d["formats"],
             "dropped": list(d["check"].loc[d["check"]["status"].str.startswith("выбыла"), "profession"]),
         },
@@ -211,6 +222,13 @@ h1 { font: 700 22px/1.2 var(--f-body); margin: 0; letter-spacing: -0.01em; }
 .filters select, .filters input { width: 100%; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; height: 38px; font-size: 13.5px; transition: border-color .15s, background .15s; }
 .filters select:hover, .filters input:hover { border-color: var(--views); }
 .filters select.on { border-color: var(--views); background: var(--sel); color: var(--ink); font-weight: 500; }
+.filters .range { display: flex; align-items: center; gap: 6px; min-width: 0; height: 38px; padding: 0 6px 0 10px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; font-size: 13.5px; color: var(--text); white-space: nowrap; transition: border-color .15s, background .15s; }
+.filters .range:hover, .filters .range:focus-within { border-color: var(--views); }
+.filters .range.on { border-color: var(--views); background: var(--sel); color: var(--ink); font-weight: 500; }
+.filters .range input { flex: 1 1 0; width: 0; min-width: 0; height: 28px; padding: 0 4px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); text-align: center; font-variant-numeric: tabular-nums; -moz-appearance: textfield; appearance: textfield; }
+.filters .range input::-webkit-outer-spin-button, .filters .range input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
 /* сетка */
 main.container { display: grid; gap: 16px; padding-block: 20px 48px; }
@@ -287,14 +305,15 @@ svg .dot.on { fill: var(--vacs); }
 
 /* факторы: расходящиеся полосы от нуля, длина — логарифм отношения к медиане профессии */
 .fx { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 4px 18px 18px; align-items: start; }
+.fx-col { display: grid; gap: 12px; align-content: start; min-width: 0; }
 .fx-g { border: 1px solid var(--line); border-radius: 10px; background: #fafbfd; padding: 0 8px 8px; }
 .fx-g h3 { font: 600 12.5px var(--f-body); color: var(--ink); margin: 0 -8px 6px; padding: 9px 12px 8px; border-bottom: 1px solid var(--line); background: var(--surface); border-radius: 10px 10px 0 0; }
 .fx-r { display: grid; grid-template-columns: minmax(0, 1fr) 34% 3.4em; gap: 8px; align-items: center; min-height: 26px; padding: 0 4px; border-radius: 6px; }
 .fx-r:hover, .fx-r:focus-visible { background: var(--sel); }
 .fx-r.dim { opacity: .45; }
-.fx-list { grid-template-columns: minmax(0, 1fr); gap: 0; padding: 6px 12px 12px; }
-.fx-list .fx-r { grid-template-columns: minmax(0, 1fr) 30% 3.6em; cursor: pointer; min-height: 30px; }
-.fx-list .fx-r[aria-pressed="true"] { background: var(--sel); box-shadow: inset 3px 0 0 var(--views); }
+.fx-r { cursor: pointer; }
+.fx-r[aria-pressed="true"] { background: var(--sel); box-shadow: inset 3px 0 0 var(--views); }
+.fx-r[aria-pressed="true"] .fx-l { font-weight: 600; color: var(--ink); }
 .fx-l { font-size: 12.5px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fx-b { position: relative; height: 10px; }
 .fx-b::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--muted); opacity: .45; }
@@ -303,6 +322,30 @@ svg .dot.on { fill: var(--vacs); }
 .fx-b i.neg { right: 50%; background: var(--neg); border-radius: 4px 0 0 4px; }
 .fx-v { font: 600 12.5px var(--f-body); font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
 .chip.pl { color: #1e3a8a; background: #dbeafe; }
+/* рейтинг вакансий: таблица, шапка прилипает при прокрутке */
+.vt-wrap { overflow: auto; max-height: 680px; border-top: 1px solid var(--line); overscroll-behavior: contain; }
+.vt { width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; font-size: 13.5px; }
+.vt th { position: sticky; top: 0; z-index: 1; background: var(--surface); text-align: left; font: 600 12px var(--f-body); color: var(--muted);
+  padding: 9px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.vt th button { background: none; border: 0; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+.vt th button:hover, .vt th.on button { color: var(--ink); }
+.vt th.on button::after { content: " ▼"; font-size: 9px; }
+.vt td { padding: 8px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.vt tbody tr:hover td { background: var(--sel); }
+.vt .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.vt td.idx { color: var(--muted); font-size: 12px; }
+.vt td.t { min-width: 240px; }
+.vt td.t a { font-weight: 500; color: var(--text); text-decoration: none; }
+.vt td.t a:hover { color: var(--primary); text-decoration: underline; text-underline-offset: 3px; }
+.vt small { display: block; color: var(--muted); font-size: 12px; margin-top: 1px; }
+.vt td.main { font-weight: 700; color: var(--views); font-size: 14px; }
+.vt td.cbar { background-image: linear-gradient(var(--views-soft), var(--views-soft)); background-repeat: no-repeat; background-position: right 4px top 7px; }
+/* при переходе к таблице её шапка не прячется под закреплённой строкой фильтров */
+#vac-card { scroll-margin-top: 118px; }
+.vac-count { font: 600 13px var(--f-body); color: var(--muted); font-variant-numeric: tabular-nums; }
+#vac-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-right: auto; }
+.vt td.p { color: var(--text); max-width: 170px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vt td.f { white-space: nowrap; }
 #tip { position: fixed; z-index: 20; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
   box-shadow: 0 10px 30px rgba(15, 23, 42, .18); padding: 10px 12px; font-size: 12.5px; min-width: 200px; max-width: 300px; }
 #tip .t { font-weight: 600; margin-bottom: 6px; color: var(--ink); font-size: 13px; }
@@ -334,7 +377,7 @@ svg .dot.on { fill: var(--vacs); }
 BODY = """<div class="topbar"><div class="container">
   <div class="brand"><h1>__TITLE__</h1><div class="meta" id="meta"></div></div>
   <div class="view">
-    <div class="seg" role="group" aria-label="Метрика"><button type="button" data-m="med" aria-pressed="true">Медиана</button><button type="button" data-m="mean" aria-pressed="false">Среднее</button></div>
+    <div class="seg" role="group" aria-label="Главная метрика"><button type="button" data-vm="resp" aria-pressed="true">Отклики</button><button type="button" data-vm="view" aria-pressed="false">Смотрят</button></div>
     <label class="toggle"><input id="f-dups" type="checkbox"><span id="f-dups-l">Копии</span></label>
     <button class="btn-bar" id="f-reset" type="button">Сбросить</button>
     <button class="btn-bar primary" id="csv" type="button">Скачать CSV</button>
@@ -349,55 +392,24 @@ BODY = """<div class="topbar"><div class="container">
   <select id="f-pl" aria-label="Тариф размещения на hh"><option value="">Тариф: все</option><option value="0">Премиум</option><option value="1">Стандарт+</option><option value="2">Стандарт</option><option value="3">Зарплата.ру</option><option value="np">Без Премиума</option></select>
   <select id="f-exp" aria-label="Опыт"><option value="">Опыт: все</option><option value="noExperience">Без опыта</option><option value="between1And3">Опыт 1–3 года</option><option value="between3And6">Опыт 3–6 лет</option><option value="moreThan6">Опыт более 6 лет</option></select>
   <select id="f-sal" aria-label="Зарплата"><option value="">Зарплата: все</option><option value="any">Зарплата указана</option><option value="50000">до ≥ 50 000 ₽</option><option value="100000">до ≥ 100 000 ₽</option><option value="150000">до ≥ 150 000 ₽</option><option value="200000">до ≥ 200 000 ₽</option><option value="300000">до ≥ 300 000 ₽</option></select>
-  <select id="f-fresh" aria-label="Дата публикации"><option value="0">Дата: все</option><option value="3">За 3 дня</option><option value="7">За 7 дней</option><option value="14">За 14 дней</option><option value="30">За 30 дней</option></select>
+  <div class="range" id="f-life"><span>Живёт, дн.</span><input id="f-lmin" type="number" min="0" step="1" inputmode="numeric" placeholder="от" aria-label="Срок жизни от, дней"><span>–</span><input id="f-lmax" type="number" min="0" step="1" inputmode="numeric" placeholder="до" aria-label="Срок жизни до, дней"></div>
   <select id="f-depth" aria-label="Глубина выдачи"></select>
   <select id="f-min" aria-label="Минимум вакансий в профессии"></select>
 </form></div>
 
 <main class="container">
-<section class="kpis" id="overview" aria-label="Итоги"><p class="empty">Загрузка данных…</p></section>
-
-<div class="grid">
-  <section class="card s12" aria-labelledby="h-top">
-    <div class="card-h"><h2 id="h-top">Топ-15 профессий</h2><span class="tag" id="top-note"></span></div>
-    <div class="card-b"><div class="chart" id="ch-top"></div></div>
-  </section>
-
-  <section class="card s6" aria-labelledby="h-prof">
-    <div class="card-h"><h2 id="h-prof">Рейтинг профессий</h2><span class="tag" id="prof-note"></span></div>
-    <div class="list-fixed"><div class="rows" id="prof-list"></div></div>
-    <div class="foot"><button class="btn" id="prof-more" type="button"></button><span id="prof-shown"></span></div>
-  </section>
-  <section class="card s6" id="vac-card" aria-labelledby="h-vac">
-    <div class="card-h"><h2 id="h-vac">Рейтинг вакансий</h2><span id="vac-note"></span>
-      <select id="vac-sort" aria-label="Сортировка вакансий"><option value="views">Больше смотрят</option><option value="resp">Больше откликов</option><option value="rank">Выше в выдаче</option><option value="fresh">Свежие</option><option value="salary">Выше зарплата</option></select></div>
-    <div class="list-fixed"><ol class="vac-list" id="vac-list"></ol></div>
-    <div class="foot"><button class="btn" id="vac-more" type="button">Показать ещё 50</button><span id="vac-shown"></span></div>
-  </section>
-
-  <section class="card s12" aria-labelledby="h-fac">
-    <div class="card-h"><h2 id="h-fac">Что влияет на просмотры</h2><span class="tag" id="fac-note">относительно той же профессии</span></div>
-    <div class="fx" id="fx"></div>
-  </section>
-
-  <section class="card s5" id="cmp-card" aria-labelledby="h-cmp">
-    <div class="card-h"><h2 id="h-cmp">Удалёнка против офиса</h2><span class="tag">удалённо к офису и гибриду</span></div>
-    <div class="fill"><div class="fx fx-list" id="cmp"></div></div>
-  </section>
-  <section class="card s7" aria-labelledby="h-sph">
-    <div class="card-h"><h2 id="h-sph">Сферы: доля просмотров и вакансий</h2><div class="legend" id="sph-legend"></div></div>
-    <div class="card-b"><div class="chart" id="ch-sph"></div></div>
-  </section>
-
-  <section class="card s7" aria-labelledby="h-sc">
-    <div class="card-h"><h2 id="h-sc">Предложение и интерес</h2><span class="tag" id="sc-note"></span></div>
-    <div class="card-b"><div class="chart" id="ch-sc"></div></div>
-  </section>
-  <section class="card s5" aria-labelledby="h-emp">
-    <div class="card-h"><h2 id="h-emp">Топ работодателей</h2><span class="tag">смотрят, всего</span></div>
-    <div class="card-b"><div class="chart" id="ch-emp"></div></div>
-  </section>
-</div>
+<section class="card" id="vac-card" aria-labelledby="h-vac">
+  <div class="card-h"><h2 id="h-vac">Рейтинг вакансий</h2><span id="vac-note"></span>
+    <select id="vac-sort" aria-label="Сортировка вакансий"><option value="resp">Больше откликов</option><option value="rpd">Больше откликов в сутки</option>
+      <option value="life">Дольше живут</option><option value="views">Больше смотрят</option><option value="fresh">Новые</option>
+      <option value="salary">Выше зарплата</option><option value="rank">Выше в выдаче</option></select></div>
+  <div class="vt-wrap"><table class="vt"><thead id="vt-head"></thead><tbody id="vac-list"></tbody></table></div>
+  <div class="foot"><button class="btn" id="vac-more" type="button">Показать ещё 50</button><span id="vac-shown"></span></div>
+</section>
+<section class="card" aria-labelledby="h-fac">
+  <div class="card-h"><h2 id="h-fac">Что влияет на отклики</h2><span class="tag" id="fac-note">относительно той же профессии</span></div>
+  <div class="fx" id="fx"></div>
+</section>
 </main>
 <div id="tip" role="tooltip" hidden></div>
 <script type="application/octet-stream" id="dash-gz">__DATA__</script>
@@ -417,7 +429,16 @@ JS = r"""
   var D = await loadData();
   var META = D.meta, IND = D.industries, PROF = D.professions, VAC = D.vacancies, AREAS = D.areas;
   var P = 0, VW = 1, RK = 2, SR = 3, TI = 4, EM = 5, SF = 6, ST = 7, CU = 8, PD = 9, AG = 10, EX = 11, ID = 12, DU = 13,
-      RS = 14, AR = 15, PL = 16, FL = 17, RT = 18, RV = 19, EP = 20, SC = 21, WH = 22, FM = 23, RG = 24;
+      RS = 14, AR = 15, PL = 16, FL = 17, RT = 18, RV = 19, EP = 20, SC = 21, WH = 22, FM = 23, RG = 24, LT = 25, CR = 26;
+  // Главная метрика — отклики (responsesCount hh, копятся с публикации); вторая — «смотрят сейчас».
+  var METRICS = {
+    resp: {col: RS, q: 'откликов', gen: 'откликов', total: 'Откликов, всего', short: 'откликов', sort: 'resp', fac: 'отклики'},
+    view: {col: VW, q: '«смотрят»', gen: 'просмотров', total: 'Смотрят сейчас, всего', short: 'смотрят', sort: 'views', fac: 'просмотры'}
+  };
+  function M() { return METRICS[state.vm]; }
+  // Срок жизни (LT) — дней с создания вакансии до замера; отклики в сутки — с делителем не меньше суток.
+  function rpd(r) { return r[RS] == null || r[LT] == null ? null : r[RS] / Math.max(r[LT], 1); }
+  function mv(r) { return r[M().col]; }
   var FORMATS = ['Только удалённо', 'Удалённо как вариант', 'Гибрид', 'Офис', 'Разъездной', 'Не указан'];
   // Строки вакансий хранят номера в словарях — разворачиваем один раз при загрузке.
   (function () {
@@ -425,6 +446,7 @@ JS = r"""
     VAC.forEach(function (r) {
       r[TI] = D.titles[r[TI]] || ''; r[EM] = D.employers[r[EM]] || null; r[CU] = D.currencies[r[CU]] || null;
       r[EX] = D.experience[r[EX]] || null; r[PD] = r[PD] == null ? null : new Date(base - r[PD] * 864e5).toISOString().slice(0, 10);
+      r[CR] = r[CR] == null ? null : new Date(base - r[CR] * 864e5).toISOString().slice(0, 10);
     });
   })();
   // Биты FL — в том же порядке, что FLAG_BITS в dashboard.py.
@@ -541,134 +563,42 @@ JS = r"""
   }
   window.addEventListener('scroll', hideTip, {passive: true});
 
-  // ---------- charts ----------
-  // Столбцы: items [{label, value, sub, info, onClick, dim, on}]. На узком контейнере — горизонтальные полосы.
-  function columnChart(box, items, o) {
-    o = o || {}; box.textContent = '';
-    if (!items.length) return emptyState(box);
-    var W = width(box);
-    if (o.hbarBelow && W < o.hbarBelow) return hbarChart(box, items, o);
-    var lines = o.lines || 1, H = o.height || 240, padL = 34, padR = 6, padT = 18, padB = 16 + lines * 13 + (o.sub ? 16 : 0);
-    var max = o.max != null ? o.max : Math.max.apply(null, items.map(function (i) { return i.value || 0; }));
-    var sc = scale(max, 4), ih = H - padT - padB, iw = W - padL - padR, band = iw / items.length, bw = Math.min(24, band * 0.62);
-    var svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', 'aria-label': o.aria || ''}, box);
-    sc.list.forEach(function (v) { var y = padT + ih - v / sc.top * ih; S('line', {x1: padL, x2: W - padR, y1: y, y2: y, 'class': 'gl'}, svg); T(svg, padL - 6, y + 3.5, o.tick ? o.tick(v) : fmt(v), 'ax num', 'end'); });
-    items.forEach(function (it, i) {
-      var cx = padL + band * i + band / 2, h = Math.max(0, (it.value || 0) / sc.top * ih), y = padT + ih - h;
-      var g = S('g', {'class': 'mk' + (it.dim ? ' dim' : '') + (it.on ? ' on' : '')}, svg);
-      S('rect', {x: padL + band * i, y: padT, width: band, height: ih, 'class': 'hit'}, g);
-      S('path', {d: colPath(cx - bw / 2, y, bw, h, 4), 'class': o.cls || 'c-views'}, g);
-      T(g, cx, y - 5, o.fmt ? o.fmt(it.value) : fmt(it.value), 'val', 'middle');
-      wrapLines(it.label, band - 4, lines).forEach(function (ln, li) { T(g, cx, padT + ih + 15 + li * 13, ln, 'ax', 'middle'); });
-      if (o.sub && it.sub) T(g, cx, padT + ih + 15 + lines * 13 + 2, it.sub, 'ax num', 'middle');
-      if (it.info) bindTip(g, it.info, it.onClick);
-    });
-    S('line', {x1: padL, x2: W - padR, y1: padT + ih, y2: padT + ih, 'class': 'base'}, svg);
-  }
-  // Горизонтальные полосы: подписи слева, значение у конца полосы.
-  function hbarChart(box, items, o) {
-    o = o || {}; box.textContent = '';
-    if (!items.length) return emptyState(box);
-    var W = width(box), rowH = 30, padT = 4, labW = Math.min(Math.round(W * 0.42), 260), valW = 52;
-    var H = padT + rowH * items.length + 6, iw = W - labW - valW - 8;
-    var max = o.max != null ? o.max : Math.max.apply(null, items.map(function (i) { return i.value || 0; })) || 1;
-    var svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', 'aria-label': o.aria || ''}, box);
-    var chars = Math.floor((labW - 8) / 6.4);
-    items.forEach(function (it, i) {
-      var y = padT + rowH * i, g = S('g', {'class': 'mk' + (it.dim ? ' dim' : '') + (it.on ? ' on' : '')}, svg);
-      S('rect', {x: 0, y: y, width: W, height: rowH, 'class': 'hit'}, g);
-      T(g, 0, y + 14, trunc(it.label, chars), 'ax');
-      if (it.sub) T(g, 0, y + 26, trunc(it.sub, chars), 'ax num');
-      var w = Math.max(0, (it.value || 0) / max * iw);
-      S('path', {d: barPath(labW, y + 8, w, 12, 4), 'class': o.cls || 'c-views'}, g);
-      T(g, labW + w + 6, y + 18, o.fmt ? o.fmt(it.value) : fmt(it.value), 'val');
-      if (it.info) bindTip(g, it.info, it.onClick);
-    });
-  }
-  var sphShow = {views: true, vacs: true};
-  function sphereChart(box, rows) {
-    box.textContent = '';
-    if (!rows.length) return emptyState(box);
-    var W = width(box), rowH = 34, labW = Math.min(Math.round(W * 0.36), 240), idxW = 54, iw = W - labW - idxW - 50;
-    var H = 22 + rowH * rows.length, svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img',
-      'aria-label': 'Доля просмотров и доля вакансий по сферам. Больше всего просмотров: ' + IND[rows[0].i]}, box);
-    var max = 0; rows.forEach(function (r) { if (sphShow.views) max = Math.max(max, r.sv); if (sphShow.vacs) max = Math.max(max, r.sn); }); max = max || 1;
-    T(svg, W - 4, 12, 'индекс', 'ax', 'end');
-    var chars = Math.floor((labW - 8) / 6.4);
-    rows.forEach(function (r, i) {
-      var y = 20 + rowH * i, g = S('g', {'class': 'mk'}, svg);
-      S('rect', {x: 0, y: y, width: W, height: rowH, 'class': 'hit'}, g);
-      T(g, 0, y + 19, trunc(IND[r.i], chars), 'ax');
-      var y1 = y + 7, wv = r.sv / max * iw, wn = r.sn / max * iw;
-      if (sphShow.views) { S('path', {d: barPath(labW, y1, wv, 9, 4), 'class': 'c-views'}, g); T(g, labW + wv + 5, y1 + 8, pct(r.sv), 'val'); }
-      if (sphShow.vacs) { S('path', {d: barPath(labW, y1 + 11, wn, 9, 4), 'class': 'c-vacs'}, g); T(g, labW + wn + 5, y1 + 19, pct(r.sn), 'ax num'); }
-      T(g, W - 4, y + 19, r.sn > 0 ? '×' + nf.format(r.sv / r.sn) : '—', 'val', 'end');
-      bindTip(g, {t: IND[r.i], rows: [['Доля просмотров', pct(r.sv)], ['Доля вакансий', pct(r.sn)], ['Индекс внимания', r.sn > 0 ? '×' + nf.format(r.sv / r.sn) : '—'],
-        ['Смотрят сейчас, всего', fmt(r.views)], ['Вакансий', fmt(r.n)]]}, function () { setIndustry(r.i); });
-    });
-  }
-  function scatterChart(box, pts) {
-    box.textContent = '';
-    pts = pts.filter(function (p) { return p.x > 0; });
-    if (pts.length < 3) return emptyState(box, 'Слишком мало профессий под эти фильтры для графика.');
-    var W = width(box), H = 420, padL = 40, padR = 14, padT = 14, padB = 40, iw = W - padL - padR, ih = H - padT - padB;
-    var xs = pts.map(function (p) { return p.x; }), lx0 = Math.log10(Math.min.apply(null, xs) * 0.8), lx1 = Math.log10(Math.max.apply(null, xs) * 1.25);
-    var sc = scale(Math.max.apply(null, pts.map(function (p) { return p.y; })), 4);
-    var X = function (v) { return padL + (Math.log10(v) - lx0) / (lx1 - lx0) * iw; }, Y = function (v) { return padT + ih - v / sc.top * ih; };
-    var svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', 'aria-label': 'Точечный график: число удалённых вакансий профессии и сколько их смотрят'}, box);
-    sc.list.forEach(function (v) { S('line', {x1: padL, x2: W - padR, y1: Y(v), y2: Y(v), 'class': 'gl'}, svg); T(svg, padL - 6, Y(v) + 3.5, fmt(v), 'ax num', 'end'); });
-    [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000].forEach(function (v) {
-      var lv = Math.log10(v); if (lv < lx0 || lv > lx1) return;
-      S('line', {x1: X(v), x2: X(v), y1: padT, y2: padT + ih, 'class': 'gl'}, svg); T(svg, X(v), padT + ih + 15, nf0.format(v), 'ax num', 'middle');
-    });
-    T(svg, padL + iw / 2, H - 6, 'вакансий профессии (логарифмическая шкала)', 'ax', 'middle');
-    var yl = T(svg, 12, padT + ih / 2, (state.metric === 'med' ? 'медиана' : 'среднее') + ' «смотрят»', 'ax', 'middle'); yl.setAttribute('transform', 'rotate(-90 12 ' + (padT + ih / 2) + ')');
-    var order = pts.slice().sort(function (a, b) { return b.y - a.y; }), labeled = {};
-    order.slice(0, 3).forEach(function (p) { labeled[p.p] = 1; }); if (state.prof >= 0) labeled[state.prof] = 1;
-    pts.forEach(function (p) {
-      var c = S('circle', {cx: X(p.x), cy: Y(p.y), r: 5, 'class': 'dot' + (p.p === state.prof ? ' on' : '')}, svg);
-      p.cx = X(p.x); p.cy = Y(p.y); p.node = c;
-    });
-    // Подпись ставим справа, при наложении — слева, если и там занято — не ставим (значение есть в подсказке).
-    var boxes = [];
-    function free(b) { return b.x0 >= padL && b.x1 <= W - 2 && boxes.every(function (o) { return b.x1 < o.x0 || b.x0 > o.x1 || b.y1 < o.y0 || b.y0 > o.y1; }); }
-    pts.forEach(function (p) { boxes.push({x0: p.cx - 6, x1: p.cx + 6, y0: p.cy - 6, y1: p.cy + 6}); });
-    order.filter(function (p) { return labeled[p.p]; }).forEach(function (p) {
-      var s = trunc(PROF[p.p].n, 26), w = s.length * 6, y0 = p.cy - 18, y1 = p.cy - 4;
-      var right = {x0: p.cx + 8, x1: p.cx + 8 + w, y0: y0, y1: y1}, left = {x0: p.cx - 8 - w, x1: p.cx - 8, y0: y0, y1: y1};
-      if (free(right)) { boxes.push(right); T(svg, right.x0, p.cy - 7, s, 'ax'); }
-      else if (free(left)) { boxes.push(left); T(svg, left.x1, p.cy - 7, s, 'ax', 'end'); }
-    });
-    // Ближайшая точка в радиусе 24px — не нужно целиться в 10-пиксельный кружок.
-    var hit = S('rect', {x: padL, y: padT, width: iw, height: ih, 'class': 'hit'}, svg), cur = null;
-    function nearest(e) {
-      var r = svg.getBoundingClientRect(), mx = (e.clientX - r.left) * W / r.width, my = (e.clientY - r.top) * H / r.height, best = null, bd = 24 * 24;
-      pts.forEach(function (p) { var d = (p.cx - mx) * (p.cx - mx) + (p.cy - my) * (p.cy - my); if (d < bd) { bd = d; best = p; } });
-      return best;
-    }
-    function info(p) { return {t: PROF[p.p].n, rows: [[state.metric === 'med' ? 'Медиана «смотрят»' : 'Среднее «смотрят»', fmt(p.y)], ['Вакансий', fmt(p.n)], ['Отрасль', IND[PROF[p.p].i]]]}; }
-    hit.addEventListener('pointermove', function (e) {
-      var p = nearest(e); if (cur && cur !== p) cur.node.setAttribute('r', 5);
-      cur = p; if (p) { p.node.setAttribute('r', 7); showTip(info(p), e.clientX, e.clientY); hit.style.cursor = 'pointer'; } else { hideTip(); hit.style.cursor = 'default'; }
-    });
-    hit.addEventListener('pointerleave', function () { if (cur) cur.node.setAttribute('r', 5); cur = null; hideTip(); });
-    hit.addEventListener('click', function (e) { var p = nearest(e); if (p) selectProf(p.p); });
-  }
   // ---------- state & data ----------
   var haystack = VAC.map(function (r) { var pr = PROF[r[P]]; return (r[TI] + ' ' + (r[EM] || '') + ' ' + pr.n + ' ' + IND[pr.i] + ' ' + area(r)).toLowerCase(); });
   var ALL = META.formats === 'all';
   // Москва (1) и Московская область (2019) — разные регионы hh; по умолчанию смотрим их вместе.
   var MSK_REG = [1, 2019];
-  var DEF = {ind: -1, reg: 'msk', fmt: ALL ? 'r' : '', exp: '', sal: '', pl: '', fresh: 0, depth: 0, minN: META.min_n, metric: 'med', q: '', dups: false};
+  var DEF = {fx: '', ind: -1, reg: '', fmt: '', exp: '', sal: '', pl: '', lmin: '', lmax: '', depth: 0, minN: META.min_n, metric: 'med', vm: 'resp', q: '', dups: false, vacSort: 'resp'};
   function fmtOk(f, s) { return !s || (s === 'r' ? f === 0 : s === 'rx' ? f === 1 : s === 'nr' ? f >= 2 : s === 'h' ? f === 2 : s === 'o' ? f === 3 : s === 'f' ? f === 4 : true); }
-  var state = Object.assign({prof: -1, profAll: false, vacLimit: VAC_PAGE, vacSort: 'views'}, DEF), res = null;
+  var state = Object.assign({prof: -1, profAll: false, vacLimit: VAC_PAGE}, DEF), res = null;
+  // Настроенные фильтры живут в браузере зрителя и восстанавливаются при следующем открытии.
+  var STORE = 'hh-dash-filters-v1';
+  var SAVE_KEYS = ['fx', 'reg', 'fmt', 'exp', 'sal', 'pl', 'lmin', 'lmax', 'depth', 'minN', 'metric', 'vm', 'q', 'dups', 'vacSort'];
+  function save() {
+    try {
+      var o = {ind: state.ind >= 0 ? IND[state.ind] : ''};
+      SAVE_KEYS.forEach(function (k) { o[k] = state[k]; });
+      localStorage.setItem(STORE, JSON.stringify(o));
+    } catch (e) { /* хранилище недоступно — фильтры просто не запомнятся */ }
+  }
+  function restore() {
+    try {
+      var o = JSON.parse(localStorage.getItem(STORE) || 'null');
+      if (!o) return;
+      SAVE_KEYS.forEach(function (k) { if (k in o) state[k] = o[k]; });
+      state.ind = o.ind ? IND.indexOf(o.ind) : -1;
+      if (!METRICS[state.vm]) state.vm = DEF.vm;
+    } catch (e) { /* нет сохранённых фильтров */ }
+  }
 
-  // anyFormat — без фильтра формата (для сравнения удалёнки с офисом).
-  function filtered(anyFormat) {
-    var out = [], q = state.q;
+  // anyFormat — без фильтра формата; noFx — без фильтра по фактору (для самого блока «Что влияет»).
+  function filtered(anyFormat, noFx) {
+    var out = [], q = state.q, col = M().col, fxG = -1, fxI = -1, gl = null;
+    if (state.fx && !noFx) { fxG = +state.fx.split(':')[0]; fxI = +state.fx.split(':')[1]; gl = groupLevels(); }
     for (var k = 0; k < VAC.length; k++) {
       var r = VAC[k];
-      if (r[VW] == null) continue;
+      if (fxG >= 0) { var lv = gl[fxG][k]; if (FACTOR_GROUPS[fxG].multi ? !((lv >> fxI) & 1) : lv !== fxI) continue; }
+      if (r[col] == null) continue;
       if (r[DU] && !state.dups) continue;
       if (state.reg === 'msk') { if (r[RG] !== 1 && r[RG] !== 2019) continue; } else if (state.reg && r[RG] !== +state.reg) continue;
       if (state.depth && r[RK] > state.depth) continue;
@@ -678,15 +608,18 @@ JS = r"""
       if (state.sal === 'any') { if (r[SF] == null && r[ST] == null) continue; }
       else if (state.sal) { if (r[CU] !== 'RUR') continue; var up = r[ST] != null ? r[ST] : r[SF]; if (up == null || up < +state.sal) continue; }
       if (state.pl === 'np') { if (r[PL] === 0) continue; } else if (state.pl !== '' && r[PL] !== +state.pl) continue;
-      if (state.fresh && (r[AG] == null || r[AG] > state.fresh)) continue;
+      if (state.lmin !== '' || state.lmax !== '') {
+        var lt = r[LT]; if (lt == null || (state.lmin !== '' && lt < +state.lmin) || (state.lmax !== '' && lt > +state.lmax)) continue;
+      }
       if (q && haystack[k].indexOf(q) === -1) continue;
       out.push(k);
     }
     return out;
   }
   function compute() {
-    var rows = filtered(), byP = {}, key = state.metric;
-    rows.forEach(function (k) { var p = VAC[k][P]; (byP[p] = byP[p] || []).push(VAC[k][VW]); });
+    // Набор профессий («от N вакансий») считаем без фильтра по фактору, чтобы клик по фактору не менял его.
+    var all = filtered(false, true), rows = all, byP = {}, key = state.metric, col = M().col;
+    rows.forEach(function (k) { var p = VAC[k][P]; (byP[p] = byP[p] || []).push(VAC[k][col]); });
     var profs = [];
     Object.keys(byP).forEach(function (pk) {
       var v = Float64Array.from(byP[pk]).sort(); if (v.length < state.minN) return;
@@ -695,9 +628,10 @@ JS = r"""
     });
     profs.sort(function (a, b) { return (b[key] - a[key]) || (b.mean - a.mean) || (b.n - a.n); });
     var keep = {}; profs.forEach(function (s, i) { s.place = i + 1; keep[s.p] = s; });
-    var vac = rows.filter(function (k) { return keep[VAC[k][P]]; });
+    var inKeep = function (k) { return keep[VAC[k][P]]; };
+    var vacAll = all.filter(inKeep), vac = state.fx ? filtered().filter(inKeep) : vacAll;
     if (state.prof >= 0 && !keep[state.prof]) state.prof = -1;
-    return {profs: profs, keep: keep, vac: vac};
+    return {profs: profs, keep: keep, vac: vac, vacAll: vacAll};
   }
 
   // ---------- render: KPI ----------
@@ -706,53 +640,8 @@ JS = r"""
     var d = el('div', 'kpi'); d.appendChild(el('span', 'lab', label)); d.appendChild(el('span', 'val' + (isName ? ' name' : ''), value));
     if (sub) d.appendChild(el('span', 'sub', sub)); return d;
   }
-  function renderKpis() {
-    var k = $('overview'); k.textContent = '';
-    var all = Float64Array.from(res.vac, function (i) { return VAC[i][VW]; }).sort(), sum = 0, inds = {}, emps = {};
-    var resp = Float64Array.from(res.vac.map(function (i) { return VAC[i][RS]; }).filter(function (x) { return x != null; })).sort();
-    res.vac.forEach(function (i) { var r = VAC[i]; sum += r[VW]; inds[PROF[r[P]].i] = 1; emps[r[EM] || ''] = 1; });
-    var ni = Object.keys(inds).length, ne = Object.keys(emps).length;
-    k.appendChild(kpi('Профессий', fmt(res.profs.length), ni + ' ' + plural(ni, 'отрасль', 'отрасли', 'отраслей')));
-    k.appendChild(kpi('Вакансий', fmt(res.vac.length), fmt(ne) + ' ' + plural(ne, 'работодатель', 'работодателя', 'работодателей')));
-    k.appendChild(kpi('Смотрят сейчас', fmt(sum), 'человек на всех вакансиях'));
-    k.appendChild(kpi('Медиана на вакансию', all.length ? fmt(quant(all, .5)) : '—', 'среднее ' + fmt(mean(all))));
-    k.appendChild(kpi('Откликов на вакансию', resp.length ? fmt(quant(resp, .5)) : '—', 'медиана · среднее ' + fmt(mean(resp))));
-  }
-
   // ---------- render: charts ----------
-  function renderCharts() {
-    var key = state.metric;
-    // Топ-15
-    var top = res.profs.slice(0, 15);
-    $('top-note').textContent = metricName() + ' «смотрят сейчас»';
-    columnChart($('ch-top'), top.map(function (s) {
-      return {label: PROF[s.p].n, value: s[key], on: s.p === state.prof, onClick: function () { selectProf(s.p); },
-        info: {t: PROF[s.p].n, rows: [['Место', '#' + s.place], ['Медиана', fmt(s.med)], ['Среднее', fmt(s.mean)], ['Вакансий', fmt(s.n)], ['Отрасль', IND[PROF[s.p].i]]]}};
-    }), {height: 300, lines: 3, hbarBelow: 560, aria: top.length ? 'Топ-15 профессий. Первое место: ' + PROF[top[0].p].n + ', ' + fmt(top[0][key]) : ''});
-
-    // Сферы
-    var totV = 0, totN = res.vac.length, bySph = {};
-    res.vac.forEach(function (k) { var i = PROF[VAC[k][P]].i, v = VAC[k][VW]; var g = bySph[i] = bySph[i] || {i: i, views: 0, n: 0}; g.views += v; g.n++; totV += v; });
-    var sph = Object.keys(bySph).map(function (i) { var g = bySph[i]; g.sv = totV ? g.views / totV : 0; g.sn = totN ? g.n / totN : 0; return g; }).sort(function (a, b) { return b.sv - a.sv; });
-    sphereChart($('ch-sph'), sph);
-
-    renderFactors();
-    renderCompare();
-    // Предложение и интерес
-    $('sc-note').textContent = metricName() + ' · лог. шкала';
-    scatterChart($('ch-sc'), res.profs.map(function (s) { return {p: s.p, x: s.n, y: s[key], n: s.n}; }));
-    // Работодатели
-    var emp = {};
-    res.vac.forEach(function (k) { var r = VAC[k], name = r[EM] || 'Без названия'; var g = emp[name] = emp[name] || {name: name, sum: 0, vals: []}; g.sum += r[VW]; g.vals.push(r[VW]); });
-    // Столько строк, чтобы карточка совпала по высоте с соседними «Сферами».
-    // Столько строк, чтобы карточка совпала по высоте с соседним точечным графиком (420 px).
-    var nEmp = window.innerWidth > 960 ? 14 : 10;
-    var emps = Object.keys(emp).map(function (x) { return emp[x]; }).sort(function (a, b) { return b.sum - a.sum; }).slice(0, nEmp);
-    hbarChart($('ch-emp'), emps.map(function (g) {
-      return {label: g.name, sub: g.vals.length + ' ' + plural(g.vals.length, 'вакансия', 'вакансии', 'вакансий'), value: g.sum,
-        info: {t: g.name, rows: [['Смотрят сейчас, всего', fmt(g.sum)], ['Вакансий', fmt(g.vals.length)], ['Медиана на вакансию', fmt(quant(g.vals.slice().sort(asc), .5))]]}};
-    }), {aria: 'Работодатели с наибольшим суммарным числом смотрящих'});
-  }
+  function renderCharts() { renderFactors(); }
 
   // ---------- факторы ----------
   // Эффект группы = во сколько раз (смотрят + 1) в группе выше, чем в среднем по той же профессии
@@ -763,6 +652,8 @@ JS = r"""
   var FACTOR_GROUPS = [
     {t: 'Формат работы', lv: FORMATS.slice(0, 5), f: function (r) { return r[FM] <= 4 ? r[FM] : -1; }},
     {t: 'Тариф размещения', lv: ['Премиум', 'Стандарт+', 'Стандарт', 'Зарплата.ру'], f: function (r) { return r[PL] < 4 ? r[PL] : -1; }},
+    {t: 'Срок жизни, дней', lv: ['меньше 1', '1–3', '3–7', '7–14', '14–30', '30–90', '90+'],
+      f: function (r) { var a = r[LT]; if (a == null) return -1; return a < 1 ? 0 : a < 3 ? 1 : a < 7 ? 2 : a < 14 ? 3 : a < 30 ? 4 : a < 90 ? 5 : 6; }},
     {t: 'Вакансия', multi: true, lv: [
       ['Продвижение ClickMe', function (r) { return has(r, F.promo); }],
       ['Брендированная', function (r) { return has(r, F.branded); }],
@@ -783,8 +674,6 @@ JS = r"""
       ['Пометка антифрода', function (r) { return has(r, F.fraud); }]]},
     {t: 'Позиция в выдаче hh', lv: ['1–10', '11–20', '21–50', '51–100', '101–200', '201–500', '500+'],
       f: function (r) { var x = r[RK]; return x <= 10 ? 0 : x <= 20 ? 1 : x <= 50 ? 2 : x <= 100 ? 3 : x <= 200 ? 4 : x <= 500 ? 5 : 6; }},
-    {t: 'Возраст вакансии, дней', lv: ['меньше 1', '1–3', '3–7', '7–14', '14–30', '30+'],
-      f: function (r) { var a = r[AG]; if (a == null) return -1; return a < 1 ? 0 : a < 3 ? 1 : a < 7 ? 2 : a < 14 ? 3 : a < 30 ? 4 : 5; }},
     {t: 'Зарплата, верх вилки', lv: ['до 50 тыс. ₽', '50–100 тыс.', '100–150 тыс.', '150–250 тыс.', '250 тыс. и выше'],
       f: function (r) { var up = upperRub(r); if (up == null) return -1; return up < 50000 ? 0 : up < 100000 ? 1 : up < 150000 ? 2 : up < 250000 ? 3 : 4; }},
     {t: 'Опыт', lv: ['Без опыта', '1–3 года', '3–6 лет', 'Более 6 лет'],
@@ -803,9 +692,10 @@ JS = r"""
   var FX_MIN = 15;
   // Ускорение на ~160 тыс. строк: логарифмы и признаки факторов считаются один раз,
   // медианы для подсказок — по гистограмме (счётчик «смотрят» — небольшие целые числа).
-  var LV = new Float64Array(VAC.length);
-  VAC.forEach(function (r, k) { LV[k] = Math.log((r[VW] || 0) + 1); });
-  var HB = 512;
+  var LVV = new Float64Array(VAC.length), LVR = new Float64Array(VAC.length);
+  VAC.forEach(function (r, k) { LVV[k] = Math.log((r[VW] || 0) + 1); LVR[k] = Math.log((r[RS] || 0) + 1); });
+  function LVa() { return state.vm === 'resp' ? LVR : LVV; }
+  var HB = 4096;
   function hist() { return new Uint32Array(HB); }
   function hadd(h, v) { h[v >= HB ? HB - 1 : v]++; }
   function hmed(h, n) {
@@ -826,14 +716,15 @@ JS = r"""
   function signed(x, f) { var s = f.format(Math.abs(x) * 100); return (s === '0' ? '' : x > 0 ? '+' : '−') + s + '%'; }
   function renderFactors() {
     var box = $('fx'); box.textContent = '';
-    var rows = state.prof >= 0 ? res.vac.filter(function (k) { return VAC[k][P] === state.prof; }) : res.vac;
+    var rows = state.prof >= 0 ? res.vacAll.filter(function (k) { return VAC[k][P] === state.prof; }) : res.vacAll;
     $('fac-note').textContent = (state.prof >= 0 ? PROF[state.prof].n + ' · ' : '') + 'относительно той же профессии';
     if (rows.length < FX_MIN * 2) return emptyState(box, 'Слишком мало вакансий под эти фильтры для оценки факторов.');
-    var sumP = new Float64Array(PROF.length), nP = new Uint32Array(PROF.length), gl = groupLevels();
+    $('h-fac').textContent = 'Что влияет на ' + M().fac;
+    var sumP = new Float64Array(PROF.length), nP = new Uint32Array(PROF.length), gl = groupLevels(), LV = LVa(), col = M().col;
     rows.forEach(function (k) { var p = VAC[k][P]; sumP[p] += LV[k]; nP[p]++; });
     var acc = FACTOR_GROUPS.map(function (g) { return g.lv.map(function () { return {s: 0, n: 0, h: hist()}; }); });
     for (var j = 0; j < rows.length; j++) {
-      var k = rows[j], r = VAC[k], d = LV[k] - sumP[r[P]] / nP[r[P]], v = r[VW];
+      var k = rows[j], r = VAC[k], d = LV[k] - sumP[r[P]] / nP[r[P]], v = r[col];
       for (var g = 0; g < FACTOR_GROUPS.length; g++) {
         var lv = gl[g][k], A = acc[g];
         if (FACTOR_GROUPS[g].multi) { for (var i = 0; lv; i++, lv >>= 1) if (lv & 1) { A[i].s += d; A[i].n++; hadd(A[i].h, v); } }
@@ -845,86 +736,82 @@ JS = r"""
     });
     var maxAbs = 0.05;
     groups.forEach(function (g) { g.items.forEach(function (it) { if (it.n >= FX_MIN) maxAbs = Math.max(maxAbs, Math.abs(it.lr)); }); });
-    groups.forEach(function (g) {
+    // Колонки одной высоты: первые группы — по одной в колонку (верхний ряд),
+    // остальные от больших к меньшим — в самую короткую колонку. Высота группы ≈ заголовок + 26 px на строку.
+    var ncol = Math.max(1, getComputedStyle(box).gridTemplateColumns.split(' ').length);
+    var cols = [], colH = [], blocks = [];
+    for (var c = 0; c < ncol; c++) { cols.push(box.appendChild(el('div', 'fx-col'))); colH.push(0); }
+    groups.forEach(function (g, gi) {
       var gd = el('div', 'fx-g'); gd.appendChild(el('h3', null, g.t));
-      g.items.forEach(function (it) {
+      blocks.push({el: gd, h: 44 + 26 * g.items.filter(function (it) { return it.n; }).length});
+      g.items.forEach(function (it, ii) {
         if (!it.n) return;
-        var eff = Math.exp(it.lr) - 1, row = el('div', 'fx-r' + (it.n < FX_MIN ? ' dim' : ''));
+        var eff = Math.exp(it.lr) - 1, row = el('div', 'fx-r' + (it.n < FX_MIN ? ' dim' : '')), key = gi + ':' + ii;
+        row.setAttribute('aria-pressed', state.fx === key ? 'true' : 'false');
         row.appendChild(el('span', 'fx-l', it.label));
         var bar = el('span', 'fx-b'), i = el('i', it.lr >= 0 ? 'pos' : 'neg');
         i.style.width = (Math.min(1, Math.abs(it.lr) / maxAbs) * 50).toFixed(1) + '%'; bar.appendChild(i); row.appendChild(bar);
         row.appendChild(el('span', 'fx-v', signed(eff, nf0)));
         var med = hmed(it.h, it.n);
         bindTip(row, {t: g.t + ': ' + it.label, rows: [['К той же профессии', signed(eff, nf)],
-          ['Медиана «смотрят»', fmt(med)], ['Вакансий', fmt(it.n) + (it.n < FX_MIN ? ' — мало данных' : '')]]});
+          ['Медиана ' + M().q, fmt(med)], ['Вакансий', fmt(it.n) + (it.n < FX_MIN ? ' — мало данных' : '')],
+          ['Клик', state.fx === key ? 'снять фильтр' : 'показать в таблице']]}, function () { setFactor(key); });
         gd.appendChild(row);
       });
-      box.appendChild(gd);
     });
-  }
-
-  // ---------- удалёнка против офиса ----------
-  // По каждой профессии: во сколько раз удалённую вакансию смотрят больше, чем неудалённую (гибрид, офис, разъезды).
-  // Средние геометрические «смотрят + 1»; фильтр формата не применяется, остальные фильтры — да.
-  function renderCompare() {
-    var box = $('cmp'); box.textContent = '';
-    if (!ALL) { $('cmp-card').hidden = true; return; }
-    var acc = {};
-    filtered(true).forEach(function (k) {
-      var r = VAC[k], f = r[FM]; if (f === 1 || f === 5) return;
-      var a = acc[r[P]] = acc[r[P]] || {r: 0, nr: 0, o: 0, no: 0, hr: hist(), ho: hist()}, lg = LV[k];
-      if (f === 0) { a.r += lg; a.nr++; hadd(a.hr, r[VW]); } else { a.o += lg; a.no++; hadd(a.ho, r[VW]); }
-    });
-    var items = Object.keys(acc).map(function (p) { var a = acc[p]; return {p: +p, a: a, lr: a.nr && a.no ? a.r / a.nr - a.o / a.no : 0}; })
-      .filter(function (x) { return x.a.nr >= FX_MIN && x.a.no >= FX_MIN; }).sort(function (x, y) { return y.lr - x.lr; });
-    if (!items.length) return emptyState(box, 'Нет профессий, где под эти фильтры есть и удалённые, и офисные вакансии.');
-    var maxAbs = Math.max.apply(null, items.map(function (x) { return Math.abs(x.lr); }).concat([0.05]));
-    items.forEach(function (x) {
-      var eff = Math.exp(x.lr) - 1, row = el('div', 'fx-r');
-      row.setAttribute('aria-pressed', state.prof === x.p ? 'true' : 'false');
-      row.appendChild(el('span', 'fx-l', PROF[x.p].n));
-      var bar = el('span', 'fx-b'), i = el('i', x.lr >= 0 ? 'pos' : 'neg');
-      i.style.width = (Math.abs(x.lr) / maxAbs * 50).toFixed(1) + '%'; bar.appendChild(i); row.appendChild(bar);
-      row.appendChild(el('span', 'fx-v', signed(eff, nf0)));
-      bindTip(row, {t: PROF[x.p].n, rows: [['Удалённо к офису и гибриду', signed(eff, nf)],
-        ['Медиана «смотрят», удалённо', fmt(hmed(x.a.hr, x.a.nr))], ['Медиана, офис и гибрид', fmt(hmed(x.a.ho, x.a.no))],
-        ['Вакансий удалённо / офис', fmt(x.a.nr) + ' / ' + fmt(x.a.no)]]}, function () { selectProf(x.p); });
-      box.appendChild(row);
-    });
+    function place(b) { var c = colH.indexOf(Math.min.apply(null, colH)); cols[c].appendChild(b.el); colH[c] += b.h + 12; }
+    blocks.slice(0, ncol).forEach(place);
+    blocks.slice(ncol).sort(function (a, b) { return b.h - a.h; }).forEach(place);
   }
 
   // ---------- render: lists ----------
   function barCell(value, max) {
     var b = el('span', 'bar'); var i = el('i'); i.style.width = (max > 0 ? Math.max(value / max * 100, value > 0 ? 1.5 : 0) : 0).toFixed(1) + '%'; b.appendChild(i); return b;
   }
-  function renderProfs() {
-    var list = $('prof-list'); list.textContent = '';
-    var key = state.metric, rows = state.profAll ? res.profs : res.profs.slice(0, PROF_PAGE), max = res.profs.length ? res.profs[0][key] : 0;
-    $('prof-note').textContent = metricName();
-    if (!rows.length) list.appendChild(el('p', 'empty', 'Под фильтры не подходит ни одна профессия. Ослабьте фильтры или уменьшите «Мин. вакансий».'));
-    rows.forEach(function (s) {
-      var pr = PROF[s.p], b = el('button', 'prow'); b.type = 'button'; b.dataset.p = s.p;
-      b.setAttribute('aria-pressed', state.prof === s.p ? 'true' : 'false');
-      b.appendChild(el('span', 'place', '#' + s.place));
-      var nm = el('span', 'nm', pr.n);
-      nm.appendChild(el('small', null, IND[pr.i] + ' · ' + s.n + ' ' + plural(s.n, 'вакансия', 'вакансии', 'вакансий')));
-      b.appendChild(nm); b.appendChild(barCell(s[key], max)); b.appendChild(el('span', 'v', fmt(s[key])));
-      list.appendChild(b);
-    });
-    var more = $('prof-more'); more.hidden = res.profs.length <= PROF_PAGE;
-    more.textContent = state.profAll ? 'Свернуть' : 'Показать все';
-    $('prof-shown').textContent = 'Показано ' + rows.length + ' из ' + res.profs.length;
+  var FMT_SHORT = ['Удалённо', 'Удалённо или офис', 'Гибрид', 'Офис', 'Разъездной', '—'];
+  var COLS = [['#', null, 'num'], ['Вакансия', null, ''], ['Профессия', null, ''], ['Формат', null, ''], ['Зарплата', 'salary', 'num'],
+    ['Создана', 'fresh', 'num'], ['Живёт, дн.', 'life', 'num'], ['Откликов', 'resp', 'num'], ['В сутки', 'rpd', 'num'], ['Смотрят', 'views', 'num']];
+  function dateRu(s) {
+    if (!s) return '—';
+    var p = s.split('-'); return (+p[2]) + ' ' + MONTHS[+p[1] - 1] + (p[0] !== META.date.slice(0, 4) ? ' ' + p[0] : '');
   }
-  function vacItem(k, showProf) {
-    var r = VAC[k], li = el('li', 'vac');
-    var v = el('span', 'views', fmt(r[VW])); v.title = 'смотрят сейчас'; v.appendChild(el('small', null, 'смотрят')); li.appendChild(v);
-    var body = el('div'); var a = el('a', null, r[TI]); a.href = 'https://hh.ru/vacancy/' + r[ID]; a.target = '_blank'; a.rel = 'noopener'; body.appendChild(a);
-    if (r[PL] === 0) body.appendChild(el('span', 'chip pl', 'Премиум'));
-    if (r[DU]) body.appendChild(el('span', 'chip', 'копия'));
-    body.appendChild(el('span', 'm', [r[EM], salary(r), pub(r)].filter(Boolean).join(' · ')));
-    body.appendChild(el('span', 'm', [showProf ? PROF[r[P]].n : '', '№' + r[RK] + ' в выдаче', r[RS] != null ? fmt(r[RS]) + ' ' + plural(r[RS], 'отклик', 'отклика', 'откликов') : '',
-      area(r), r[EX] && EXP[r[EX]] ? 'опыт: ' + EXP[r[EX]].toLowerCase() : ''].filter(Boolean).join(' · ')));
-    li.appendChild(body); return li;
+  function lifeTxt(d) { return d == null ? '—' : d < 1 ? '<1' : nf0.format(Math.floor(d)); }
+  function renderVacHead() {
+    var tr = el('tr');
+    COLS.forEach(function (c) {
+      var th = el('th', c[2] + (c[1] && c[1] === state.vacSort ? ' on' : ''));
+      if (c[1]) {
+        var b = el('button', null, c[0]); b.type = 'button'; b.title = 'Сортировать';
+        b.addEventListener('click', function () { state.vacSort = c[1]; state.vacLimit = VAC_PAGE; $('vac-sort').value = c[1]; save(); renderVacs(); });
+        th.appendChild(b);
+        th.setAttribute('aria-sort', c[1] === state.vacSort ? 'descending' : 'none');
+      } else th.textContent = c[0];
+      tr.appendChild(th);
+    });
+    var head = $('vt-head'); head.textContent = ''; head.appendChild(tr);
+  }
+  function vacRow(k, n, mx) {
+    var r = VAC[k], tr = el('tr'), mainCol = state.vm === 'resp' ? RS : VW;
+    tr.appendChild(el('td', 'num idx', String(n)));
+    var t = el('td', 't'), a = el('a', null, r[TI]); a.href = 'https://hh.ru/vacancy/' + r[ID]; a.target = '_blank'; a.rel = 'noopener'; t.appendChild(a);
+    if (r[PL] === 0) t.appendChild(el('span', 'chip pl', 'Премиум'));
+    if (r[DU]) t.appendChild(el('span', 'chip', 'копия'));
+    t.appendChild(el('small', null, [r[EM], area(r)].filter(Boolean).join(' · ')));
+    tr.appendChild(t);
+    var pc = el('td', 'p', PROF[r[P]].n); pc.title = PROF[r[P]].n; tr.appendChild(pc);
+    tr.appendChild(el('td', 'f', FMT_SHORT[r[FM]]));
+    tr.appendChild(el('td', 'num', salary(r) || '—'));
+    tr.appendChild(el('td', 'num', dateRu(r[CR])));
+    tr.appendChild(el('td', 'num', lifeTxt(r[LT])));
+    var d = rpd(r);
+    var cr = el('td', 'num cbar' + (mainCol === RS ? ' main' : ''), r[RS] == null ? '—' : fmt(r[RS]));
+    if (mx.r > 0 && r[RS]) cr.style.backgroundSize = Math.max(2, r[RS] / mx.r * 92).toFixed(1) + '% 20px';
+    tr.appendChild(cr);
+    var cd = el('td', 'num cbar', d == null ? '—' : nf.format(d));
+    if (mx.d > 0 && d) cd.style.backgroundSize = Math.max(2, d / mx.d * 92).toFixed(1) + '% 20px';
+    tr.appendChild(cd);
+    tr.appendChild(el('td', 'num' + (mainCol === VW ? ' main' : ''), r[VW] == null ? '—' : fmt(r[VW])));
+    return tr;
   }
   function upper(r) { return r[CU] === 'RUR' ? (r[ST] != null ? r[ST] : r[SF]) : null; }
   var ORDER = {};
@@ -932,23 +819,32 @@ JS = r"""
     views: function (a, b) { return (VAC[b][VW] - VAC[a][VW]) || (VAC[a][RK] - VAC[b][RK]); },
     rank: function (a, b) { return (VAC[a][RK] - VAC[b][RK]) || (VAC[b][VW] - VAC[a][VW]); },
     resp: function (a, b) { return ((VAC[b][RS] || 0) - (VAC[a][RS] || 0)) || (VAC[b][VW] - VAC[a][VW]); },
-    fresh: function (a, b) { var x = VAC[a][AG], y = VAC[b][AG]; return (x == null) - (y == null) || (x - y) || (VAC[b][VW] - VAC[a][VW]); },
+    fresh: function (a, b) { var x = VAC[a][LT], y = VAC[b][LT]; return (x == null) - (y == null) || (x - y) || ((VAC[b][RS] || 0) - (VAC[a][RS] || 0)); },
+    life: function (a, b) { var x = VAC[a][LT], y = VAC[b][LT]; return (x == null) - (y == null) || (y - x) || ((VAC[b][RS] || 0) - (VAC[a][RS] || 0)); },
+    rpd: function (a, b) { var x = rpd(VAC[a]), y = rpd(VAC[b]); return (x == null) - (y == null) || (y - x) || ((VAC[b][RS] || 0) - (VAC[a][RS] || 0)); },
     salary: function (a, b) { var x = upper(VAC[a]), y = upper(VAC[b]); return (x == null) - (y == null) || (y - x) || (VAC[b][VW] - VAC[a][VW]); }
   };
   function renderVacs() {
-    var list = $('vac-list'); list.textContent = '';
+    var list = $('vac-list'); list.textContent = ''; renderVacHead();
     var mask = new Uint8Array(VAC.length), total = 0;
     res.vac.forEach(function (k) { if (state.prof < 0 || VAC[k][P] === state.prof) { mask[k] = 1; total++; } });
     var ord = ORDER[state.vacSort] || (ORDER[state.vacSort] = VAC.map(function (_, k) { return k; }).sort(SORTS[state.vacSort]));
     var rows = [];
     for (var j = 0; j < ord.length && rows.length < state.vacLimit; j++) if (mask[ord[j]]) rows.push(ord[j]);
     var note = $('vac-note'); note.textContent = '';
+    note.appendChild(el('span', 'vac-count', fmt(total) + ' ' + plural(total, 'вакансия', 'вакансии', 'вакансий')));
+    if (state.fx && fxLabel(state.fx)) {
+      var fc = el('span', 'sel', fxLabel(state.fx)), fb = el('button', null, '×'); fb.type = 'button'; fb.setAttribute('aria-label', 'Снять фильтр по фактору');
+      fb.addEventListener('click', function () { setFactor(state.fx); }); fc.appendChild(fb); note.appendChild(fc);
+    }
     if (state.prof >= 0) {
       var chip = el('span', 'sel', PROF[state.prof].n); var x = el('button', null, '×'); x.type = 'button'; x.setAttribute('aria-label', 'Показать вакансии всех профессий');
       x.addEventListener('click', function () { selectProf(state.prof); }); chip.appendChild(x); note.appendChild(chip);
     }
-    if (!rows.length) list.appendChild(el('li', 'empty', 'Нет вакансий под эти фильтры.'));
-    rows.forEach(function (k) { list.appendChild(vacItem(k, state.prof < 0)); });
+    if (!rows.length) { var tr = el('tr'), td = el('td', 'empty', 'Нет вакансий под эти фильтры.'); td.colSpan = COLS.length; tr.appendChild(td); list.appendChild(tr); }
+    var mx = {r: 0, d: 0};
+    rows.forEach(function (k) { var r = VAC[k], d = rpd(r); if (r[RS] > mx.r) mx.r = r[RS]; if (d > mx.d) mx.d = d; });
+    rows.forEach(function (k, i) { list.appendChild(vacRow(k, i + 1, mx)); });
     $('vac-more').hidden = total <= state.vacLimit;
     $('vac-shown').textContent = 'Показано ' + fmt(Math.min(state.vacLimit, total)) + ' из ' + fmt(total);
   }
@@ -958,7 +854,7 @@ JS = r"""
     m.appendChild(el('span', null, 'hh.ru · ' + (ALL ? 'все форматы работы' : 'только удалённо')));
     if (META.kind !== 'measure') { var f = el('span', 'flag', 'пробный замер'); f.title = 'Снимок сделан вне окна замера (будни, 13:00 МСК)'; m.appendChild(f); }
   }
-  function render() { hideTip(); res = compute(); renderKpis(); renderCharts(); renderProfs(); renderVacs(); }
+  function render() { hideTip(); res = compute(); renderCharts(); renderVacs(); document.querySelector('.vt-wrap').scrollTop = 0; }
 
   // ---------- CSV ----------
   // Выгружаем вакансии под текущие фильтры (без фильтров — вся база дашборда). Формат под русский Excel.
@@ -969,7 +865,7 @@ JS = r"""
     var head = ['Отрасль', 'Профессия', 'Вакансия', 'Работодатель', 'Ссылка', 'Смотрят сейчас', 'Откликов', 'Позиция в выдаче', 'Место в выборке', 'Копия',
       'Регион', 'Формат работы', 'Зарплата от', 'Зарплата до', 'Валюта', 'До вычета налогов', 'Опыт', 'Занятость', 'График', 'Часы', 'Размещение', 'Платное продвижение',
       'Брендированное оформление', 'Тест', 'Сопроводительное', 'Отклик без резюме', 'HR онлайн', 'IT-аккредитация', 'HR-бренд', 'Кадровое агентство',
-      'Анонимная', 'Пометка антифрода', 'Проверенный работодатель', 'Рейтинг работодателя', 'Отзывов', 'Опубликована', 'Возраст, дней'];
+      'Анонимная', 'Пометка антифрода', 'Проверенный работодатель', 'Рейтинг работодателя', 'Отзывов', 'Опубликована', 'Создана', 'Живёт, дней', 'Откликов в сутки'];
     var b = function (r, bit) { return has(r, bit) ? 1 : 0; };
     var lines = [head.map(csvCell).join(';')];
     res.vac.forEach(function (k) {
@@ -978,12 +874,12 @@ JS = r"""
         area(r), FORMATS[r[FM]], r[SF], r[ST], r[CU], r[SF] == null && r[ST] == null ? '' : b(r, F.gross), EXP[r[EX]] || r[EX],
         EMPL[D.employment[r[EP]]] || D.employment[r[EP]], (D.schedule[r[SC]] || '').split(',').map(function (x) { return SCHED[x] || x; }).join(', '),
         (D.hours[r[WH]] || '').split(',').map(function (x) { return x === 'FLEXIBLE' ? 'гибкие' : x === 'OTHER' ? 'другое' : x.replace('HOURS_', '') + ' ч'; }).filter(function (x) { return x !== ' ч'; }).join(', '), PLACE[r[PL]], b(r, F.promo), b(r, F.branded), b(r, F.test), b(r, F.letter), b(r, F.noresume), b(r, F.online), b(r, F.it),
-        b(r, F.hr), b(r, F.agency), b(r, F.anon), b(r, F.fraud), b(r, F.trusted), r[RT], r[RV], r[PD], r[AG] == null ? null : Math.round(r[AG] * 10) / 10].map(csvCell).join(';'));
+        b(r, F.hr), b(r, F.agency), b(r, F.anon), b(r, F.fraud), b(r, F.trusted), r[RT], r[RV], r[PD], r[CR], r[LT] == null ? null : Math.round(r[LT] * 10) / 10, rpd(r) == null ? null : Math.round(rpd(r) * 10) / 10].map(csvCell).join(';'));
     });
     return '﻿' + lines.join('\r\n') + '\r\n';
   }
   function saveCsv() {
-    var narrowed = state.ind >= 0 || state.reg || state.fmt || state.exp || state.sal || state.pl || state.fresh || state.q || state.depth;
+    var narrowed = state.fx || state.ind >= 0 || state.reg || state.fmt || state.exp || state.sal || state.pl || state.lmin !== '' || state.lmax !== '' || state.q || state.depth;
     var name = 'hh_vacancies_s' + META.snapshot + '_' + (narrowed ? 'filtered_' : '') + META.date + '.csv';
     var blob = new Blob([buildCsv()], {type: 'text/csv;charset=utf-8'});
     if (downloads) { downloads.save({filename: name, data: blob}).catch(function () {}); return; }
@@ -995,10 +891,18 @@ JS = r"""
   // ---------- interactions ----------
   function selectProf(p) {
     state.prof = state.prof === p ? -1 : p; state.vacLimit = VAC_PAGE; hideTip();
-    renderProfs(); renderVacs(); renderCharts();
+    renderVacs(); renderCharts();
     if (state.prof >= 0) $('vac-card').scrollIntoView({behavior: reduceMotion ? 'auto' : 'smooth', block: 'start'});
   }
-  function setIndustry(i) { state.ind = state.ind === i ? -1 : i; state.vacLimit = VAC_PAGE; syncControls(); render(); }
+  function fxLabel(key) {
+    var p = key.split(':'), g = FACTOR_GROUPS[+p[0]], l = g && g.lv[+p[1]];
+    return g && l ? g.t + ': ' + (g.multi ? l[0] : l) : '';
+  }
+  function setFactor(key) {
+    state.fx = state.fx === key ? '' : key; state.vacLimit = VAC_PAGE; hideTip(); save(); render();
+    if (state.fx) $('vac-card').scrollIntoView({behavior: reduceMotion ? 'auto' : 'smooth', block: 'start'});
+  }
+  function setIndustry(i) { state.ind = state.ind === i ? -1 : i; state.vacLimit = VAC_PAGE; syncControls(); save(); render(); }
   IND.forEach(function (name, i) { var o = el('option', null, name); o.value = i; $('f-ind').appendChild(o); });
   (function () {
     var add = function (v, t) { var o = el('option', null, t); o.value = v; $('f-reg').appendChild(o); };
@@ -1006,46 +910,50 @@ JS = r"""
     D.regions.forEach(function (g) { add(g[0], g[1]); });
   })();
   // Глубина — позиция вакансии в своей выдаче hh (по России для удалёнки, по своему региону для офиса).
-  [0, 20, 50, 100, 200, 500, 1000].forEach(function (n) { var o = el('option', null, n ? 'Топ-' + n + ' выдачи' : 'Глубина'); o.value = n; $('f-depth').appendChild(o); });
-  [META.min_n, 20, 50, 100].filter(function (n, i, a) { return n >= META.min_n && a.indexOf(n) === i; }).forEach(function (n) { var o = el('option', null, 'От ' + n + ' вакансий'); o.value = n; $('f-min').appendChild(o); });
+  [0, 20, 50, 100, 200, 500, 1000].forEach(function (n) { var o = el('option', null, n ? 'Позиция: топ-' + n : 'Позиция в выдаче: все'); o.value = n; $('f-depth').appendChild(o); });
+  [META.min_n, 20, 50, 100].filter(function (n, i, a) { return n >= META.min_n && a.indexOf(n) === i; }).forEach(function (n) { var o = el('option', null, 'Профессии от ' + n + ' вакансий'); o.value = n; $('f-min').appendChild(o); });
   $('f-dups-l').textContent = 'Копии (' + META.dups + ')'; $('f-dups').parentNode.title = 'Учитывать копии одной вакансии';
   function syncControls() {
-    $('f-ind').value = state.ind; $('f-reg').value = state.reg; $('f-fmt').value = state.fmt; $('f-exp').value = state.exp; $('f-sal').value = state.sal; $('f-fresh').value = state.fresh; $('f-pl').value = state.pl;
+    $('f-ind').value = state.ind; $('f-reg').value = state.reg; $('f-fmt').value = state.fmt; $('f-exp').value = state.exp; $('f-sal').value = state.sal; $('f-lmin').value = state.lmin; $('f-lmax').value = state.lmax; $('f-pl').value = state.pl;
     $('f-depth').value = state.depth; $('f-min').value = state.minN; $('f-q').value = state.q; $('f-dups').checked = state.dups;
-    document.querySelectorAll('.seg button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.m === state.metric)); });
+    document.querySelectorAll('.seg button[data-vm]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.vm === state.vm)); });
+    $('vac-sort').value = state.vacSort;
     // Активный фильтр подсвечивается, чтобы было видно, что срез сужен.
-    [['f-ind', state.ind !== DEF.ind], ['f-reg', state.reg !== DEF.reg], ['f-fmt', state.fmt !== DEF.fmt], ['f-exp', !!state.exp], ['f-sal', !!state.sal], ['f-fresh', !!state.fresh], ['f-pl', state.pl !== ''],
+    [['f-ind', state.ind !== DEF.ind], ['f-reg', state.reg !== DEF.reg], ['f-fmt', state.fmt !== DEF.fmt], ['f-exp', !!state.exp], ['f-sal', !!state.sal], ['f-life', state.lmin !== '' || state.lmax !== ''], ['f-pl', state.pl !== ''],
      ['f-depth', state.depth !== DEF.depth], ['f-min', state.minN !== DEF.minN]].forEach(function (x) { $(x[0]).classList.toggle('on', x[1]); });
   }
+  // Число дней из поля ввода: пусто или не число — без ограничения.
+  function days(v) { v = String(v).trim().replace(',', '.'); return v === '' || isNaN(+v) ? '' : String(Math.max(0, Math.round(+v))); }
   function onFilter() {
-    state.ind = +$('f-ind').value; state.reg = $('f-reg').value; state.fmt = $('f-fmt').value; state.exp = $('f-exp').value; state.sal = $('f-sal').value; state.fresh = +$('f-fresh').value; state.pl = $('f-pl').value;
+    state.ind = +$('f-ind').value; state.reg = $('f-reg').value; state.fmt = $('f-fmt').value; state.exp = $('f-exp').value; state.sal = $('f-sal').value; state.lmin = days($('f-lmin').value); state.lmax = days($('f-lmax').value); state.pl = $('f-pl').value;
     state.depth = +$('f-depth').value; state.minN = +$('f-min').value; state.dups = $('f-dups').checked;
-    state.vacLimit = VAC_PAGE; syncControls(); render();
+    state.vacLimit = VAC_PAGE; syncControls(); save(); render();
   }
-  document.querySelectorAll('.seg button').forEach(function (b) { b.addEventListener('click', function () { state.metric = b.dataset.m; syncControls(); render(); }); });
+  document.querySelectorAll('.seg button[data-vm]').forEach(function (b) { b.addEventListener('click', function () {
+    state.vm = b.dataset.vm; state.vacSort = M().sort; state.vacLimit = VAC_PAGE; syncControls(); save(); render();
+  }); });
   if (!ALL) $('f-fmt').hidden = true;
-  ['f-ind', 'f-reg', 'f-fmt', 'f-exp', 'f-sal', 'f-pl', 'f-fresh', 'f-depth', 'f-min', 'f-dups'].forEach(function (id) { $(id).addEventListener('change', onFilter); });
+  ['f-ind', 'f-reg', 'f-fmt', 'f-exp', 'f-sal', 'f-pl', 'f-depth', 'f-min', 'f-dups'].forEach(function (id) { $(id).addEventListener('change', onFilter); });
+  var lTimer;
+  ['f-lmin', 'f-lmax'].forEach(function (id) { $(id).addEventListener('input', function () { clearTimeout(lTimer); lTimer = setTimeout(onFilter, 350); }); });
   var qTimer;
-  $('f-q').addEventListener('input', function () { clearTimeout(qTimer); qTimer = setTimeout(function () { state.q = $('f-q').value.trim().toLowerCase(); state.vacLimit = VAC_PAGE; render(); }, 180); });
+  $('f-q').addEventListener('input', function () { clearTimeout(qTimer); qTimer = setTimeout(function () { state.q = $('f-q').value.trim().toLowerCase(); state.vacLimit = VAC_PAGE; save(); render(); }, 180); });
   $('filters').addEventListener('submit', function (e) { e.preventDefault(); });
-  $('f-reset').addEventListener('click', function () { Object.assign(state, DEF, {prof: -1, profAll: false, vacLimit: VAC_PAGE}); syncControls(); render(); });
-  $('prof-more').addEventListener('click', function () { state.profAll = !state.profAll; renderProfs(); });
-  $('vac-more').addEventListener('click', function () { state.vacLimit += VAC_PAGE; renderVacs(); });
-  $('vac-sort').addEventListener('change', function () { state.vacSort = $('vac-sort').value; state.vacLimit = VAC_PAGE; renderVacs(); });
-  $('prof-list').addEventListener('click', function (e) { var b = e.target.closest('.prow'); if (b) selectProf(+b.dataset.p); });
-  // Легенда сфер: переключает ряды.
-  [['views', 'Доля просмотров', 'var(--views)'], ['vacs', 'Доля вакансий', 'var(--vacs)']].forEach(function (s) {
-    var b = el('button'); b.type = 'button'; b.setAttribute('aria-pressed', 'true'); var sw = el('i'); sw.style.background = s[2]; b.appendChild(sw); b.append(s[1]);
-    b.addEventListener('click', function () {
-      var other = s[0] === 'views' ? 'vacs' : 'views'; if (sphShow[s[0]] && !sphShow[other]) return;
-      sphShow[s[0]] = !sphShow[s[0]]; b.setAttribute('aria-pressed', String(sphShow[s[0]])); renderCharts();
-    });
-    $('sph-legend').appendChild(b);
+  $('f-reset').addEventListener('click', function () {
+    Object.assign(state, DEF, {prof: -1, profAll: false, vacLimit: VAC_PAGE});
+    try { localStorage.removeItem(STORE); } catch (e) { /* нечего чистить */ }
+    syncControls(); render();
   });
+  $('vac-more').addEventListener('click', function () { state.vacLimit += VAC_PAGE; renderVacs(); });
+  $('vac-sort').addEventListener('change', function () { state.vacSort = $('vac-sort').value; state.vacLimit = VAC_PAGE; save(); renderVacs(); });
   // Перерисовка графиков при изменении ширины.
   var lastW = window.innerWidth, rT;
   window.addEventListener('resize', function () { if (Math.abs(window.innerWidth - lastW) < 8) return; lastW = window.innerWidth; clearTimeout(rT); rT = setTimeout(function () { hideTip(); renderCharts(); }, 150); });
 
+  // Восстанавливаем сохранённые фильтры; значение, которого нет в списке (данные обновились), сбрасываем.
+  restore(); state.lmin = days(state.lmin); state.lmax = days(state.lmax); if (state.fx && !fxLabel(state.fx)) state.fx = ''; syncControls();
+  [['f-reg', 'reg'], ['f-fmt', 'fmt'], ['f-exp', 'exp'], ['f-sal', 'sal'], ['f-pl', 'pl'], ['f-depth', 'depth'], ['f-min', 'minN'], ['vac-sort', 'vacSort']]
+    .forEach(function (x) { if ($(x[0]).value !== String(state[x[1]])) state[x[1]] = DEF[x[1]]; });
   renderMeta(); syncControls(); render();
   // Подписи меряются по Fira Sans: когда шрифт догрузится, перерисовываем графики.
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { renderCharts(); });
@@ -1068,8 +976,9 @@ def render(data: dict, fragment: bool = False) -> str:
             f'{head}</head>\n<body>\n{body}\n</body>\n</html>\n')
 
 
-def run(conn, cfg: dict, snapshot_id: int | None, top: int | None, out_path=None, fragment: bool = False) -> str:
-    data = build_data(conn, cfg, snapshot_id, top)
+def run(conn, cfg: dict, snapshot_id: int | None, top: int | None, out_path=None, fragment: bool = False,
+        best: int | None = None) -> str:
+    data = build_data(conn, cfg, snapshot_id, top, best)
     if out_path is None:
         stamp = datetime.now(MSK).strftime("%Y-%m-%d")
         out_path = cfg["paths"]["reports"] / f"dashboard_s{data['meta']['snapshot']}_{stamp}.html"

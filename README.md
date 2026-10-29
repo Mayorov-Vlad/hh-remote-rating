@@ -33,6 +33,7 @@ python -m hhremote stability <id> <id контроля>  # устойчивос�
 python -m hhremote analyze                       # рейтинги -> reports/rating_*.xlsx
 python -m hhremote html                          # HTML с раскрытием отрасль → профессия → вакансии
 python -m hhremote dashboard                     # интерактивный дашборд -> reports/dashboard_*.html
+python -m hhremote dashboard --best 100          # дашборд только по 100 вакансиям с наибольшим числом откликов
 python -m hhremote export                        # вся база в CSV -> reports/csv/ (--raw: ещё сырые объекты hh)
 python -m hhremote status                        # что в базе
 ```

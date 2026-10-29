@@ -56,6 +56,8 @@ def main(argv=None):
         h.add_argument("--top", type=int, help="размер выборки на профессию (по умолчанию sample_size)")
         h.add_argument("--out", help="путь к HTML-файлу (по умолчанию reports/)")
         h.add_argument("--fragment", action="store_true", help="без <html>/<head>/<body> — для публикации как Artifact")
+        if name == "dashboard":
+            h.add_argument("--best", type=int, metavar="N", help="только N вакансий с наибольшим числом откликов")
     pu = sub.add_parser("pulse")
     pu.add_argument("--every", type=int, default=20, help="интервал, минут")
     pu.add_argument("--until", help="до какого момента МСК, например 2026-10-09T23:59")
@@ -150,8 +152,10 @@ def main(argv=None):
         from pathlib import Path
 
         from . import dashboard, report_html
-        module = report_html if args.cmd == "html" else dashboard
-        module.run(conn, cfg, args.snapshot, args.top, Path(args.out) if args.out else None, args.fragment)
+        if args.cmd == "dashboard":
+            dashboard.run(conn, cfg, args.snapshot, args.top, Path(args.out) if args.out else None, args.fragment, args.best)
+        else:
+            report_html.run(conn, cfg, args.snapshot, args.top, Path(args.out) if args.out else None, args.fragment)
 
     elif args.cmd == "pulse":
         from datetime import datetime, timedelta
